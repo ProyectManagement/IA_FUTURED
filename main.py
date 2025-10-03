@@ -13,31 +13,31 @@ Run: uvicorn main:app --reload --port 8000
 
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Any, Dict
 from bson import ObjectId
 import os
 import joblib
-import pandas as pd
 import traceback
 
-# Optional import for custom MongoDB connection
+# Optional import: use existing conexion.py if user has it
 try:
     from conexion import conectar_mongodb
     _HAS_CONEXION = True
 except Exception:
     _HAS_CONEXION = False
 
+# Utility: connect to MongoDB if conexion not available
 def _connect_mongo_from_env():
     from pymongo import MongoClient
-    uri = os.getenv(
-        'MONGODB_URI',
-        'mongodb+srv://FutuRed:qotG44JpqoexRsjv@cluster0.yf9o1kh.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0'
-    )
+    uri = os.getenv('MONGODB_URI', 'mongodb+srv://FutuRed:qotG44JpqoexRsjv@cluster0.yf9o1kh.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0')
     client = MongoClient(uri)
+    # If the URI contains a database name after the slash, pymongo's `MongoClient(uri)`
+    # still gives access to client.get_default_database(), but for simplicity we'll use 'futured'
     dbname = os.getenv('MONGODB_DB', 'futured')
     return client[dbname]
 
+# Load model + encoders on startup
 MODEL_PATH = os.getenv('MODEL_PATH', 'modelo_entrenado/modelo.pkl')
 ENCODERS_PATH = os.getenv('ENCODERS_PATH', 'modelo_entrenado/label_encoders.pkl')
 
@@ -61,7 +61,7 @@ class EncuestaInput(BaseModel):
     aspectos_socioeconomicos: Optional[Dict[str, Any]] = None
     condiciones_salud: Optional[Dict[str, Any]] = None
     analisis_academico: Optional[Dict[str, Any]] = None
-
+    # Accept arbitrary extra fields too
     class Config:
         extra = 'allow'
 
@@ -78,13 +78,14 @@ def load_resources():
     try:
         _model = joblib.load(MODEL_PATH)
         _label_encoders = joblib.load(ENCODERS_PATH)
+        # feature names available in scikit-learn >= 1.0 via attribute
         try:
-            _feature_names = list(_model.feature_names_in_)
-        except:
+            feature_names = list(_model.feature_names_in)
+        except Exception:
             _feature_names = None
-        print(f"✅ Modelo cargado desde: {MODEL_PATH}")
+        print(f"Modelo cargado desde: {MODEL_PATH}")
     except Exception as e:
-        print("❌ No se pudo cargar el modelo en startup:", str(e))
+        print("No se pudo cargar el modelo en startup:", str(e))
         _model = None
         _label_encoders = None
 
@@ -92,7 +93,9 @@ def load_resources():
 def health():
     return {"status": "ok", "model_loaded": _model is not None}
 
+
 def _normalize_document_for_model(doc: Dict[str, Any]) -> Dict[str, Any]:
+    # Keep consistent with modelo.normalizar_documento
     aspectos = doc.get('aspectos_socioeconomicos', {})
     salud = doc.get('condiciones_salud', {})
     academico = doc.get('analisis_academico', {})
@@ -113,6 +116,8 @@ def _normalize_document_for_model(doc: Dict[str, Any]) -> Dict[str, Any]:
         "expectativa_terminar": academico.get('expectativa_terminar')
     }
 
+import pandas as pd
+
 def _prepare_X_from_document(doc: Dict[str, Any]) -> pd.DataFrame:
     if _model is None:
         raise RuntimeError("Modelo no cargado")
@@ -120,18 +125,21 @@ def _prepare_X_from_document(doc: Dict[str, Any]) -> pd.DataFrame:
     normalized = _normalize_document_for_model(doc)
     df = pd.DataFrame([normalized])
 
+    # Map Sí/No to 1/0 for specific columns if present
     for col in ["trabaja", "padecimiento_cronico", "atencion_psicologica"]:
         if col in df.columns:
             df[col] = df[col].map({"Sí": 1, "Si": 1, "No": 0}).fillna(0).astype(int)
 
+    # Apply label encoders
     if _label_encoders:
         for col, le in _label_encoders.items():
             if col in df.columns:
                 try:
                     df[col] = le.transform(df[col].astype(str))
-                except:
+                except Exception:
                     df[col] = 0
 
+    # Ensure all model features exist
     if _feature_names:
         for col in _feature_names:
             if col not in df.columns:
@@ -141,95 +149,185 @@ def _prepare_X_from_document(doc: Dict[str, Any]) -> pd.DataFrame:
     return df
 
 def _compute_prediction(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Recibe una encuesta en el cuerpo y devuelve la probabilidad de abandono con motivo y recomendacion."""
     X = _prepare_X_from_document(doc)
     prob = float(_model.predict_proba(X)[:, 1][0])
     porcentaje = round(prob * 100, 2)
 
     if porcentaje >= 80:
         motivo = "Alto riesgo: múltiples factores académicos y personales"
-        recomendacion = "Intervención inmediata con tutor y apoyo psicológico"
-    elif porcentaje >= 50:
-        motivo = "Riesgo moderado: indicadores mixtos"
-        recomendacion = "Seguimiento académico y apoyo adicional"
+        recomendacion = "Asesoría académica urgente y apoyo psicológico"
+    elif porcentaje >= 60:
+        motivo = "Riesgo medio: bajo promedio o problemas personales"
+        recomendacion = "Tutoría y monitoreo continuo"
+    elif porcentaje >= 40:
+        motivo = "Riesgo leve: dificultad para estudiar o motivación baja"
+        recomendacion = "Seguimiento por tutor y actividades motivacionales"
     else:
-        motivo = "Bajo riesgo: condiciones favorables"
-        recomendacion = "Continuar con seguimiento regular"
-
+        motivo = "Sin riesgo aparente"
+        recomendacion = "Mantener seguimiento regular"
     return {
         "riesgo": porcentaje,
         "motivo": motivo,
-        "recomendacion": recomendacion
+        "recomendacion": recomendacion,
     }
 
-@app.post("/predict", response_model=PredictResult)
-def predict_one(encuesta: EncuestaInput):
+@app.post("/predict", response_model=Dict[str, Any])
+def predict_single(encuesta: EncuestaInput = Body(...)):
     try:
         doc = encuesta.dict()
         pred = _compute_prediction(doc)
-        return {
-            "id_alumno": doc.get("id_alumno"),
-            "nombre": doc.get("nombre"),
-            "riesgo": pred["riesgo"],
-            "motivo": pred["motivo"],
-            "recomendacion": pred["recomendacion"],
-        }
+        # Si el nombre viene en la encuesta, úsalo; si no, None
+        nombre = doc.get('nombre_alumno') or doc.get('nombre')
+        resp = {**doc, **pred}
+        if nombre:
+            resp['nombre_completo'] = nombre
+            # Evitar duplicados si venía como 'nombre'
+            resp.pop('nombre', None)
+            resp.pop('nombre_alumno', None)
+        # Eliminar ids en la respuesta
+        resp.pop('id_alumno', None)
+        resp.pop('_id', None)
+        return resp
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/predict/from_db", response_model=PredictResult)
+@app.post('/predict/from_db', response_model=Dict[str, Any])
 def predict_from_db(payload: Dict[str, Any] = Body(...)):
-    id_alumno = payload.get("id_alumno")
-    if not id_alumno:
-        raise HTTPException(status_code=400, detail="Falta id_alumno en el cuerpo")
+    """Recibe {'id_alumno': '...'} y busca la encuesta correspondiente en MongoDB para predecir."""
+    if 'id_alumno' not in payload:
+        raise HTTPException(status_code=400, detail='Falta id_alumno')
 
     try:
-        db = conectar_mongodb() if _HAS_CONEXION else _connect_mongo_from_env()
-        encuestas = db["encuestas"]
-        doc = encuestas.find_one({"id_alumno": id_alumno})
-        if not doc:
-            raise HTTPException(status_code=404, detail="No se encontró la encuesta")
+        if _HAS_CONEXION:
+            db = conectar_mongodb()
+        else:
+            db = _connect_mongo_from_env()
 
-        pred = _compute_prediction(doc)
-        return {
-            "id_alumno": doc.get("id_alumno"),
-            "nombre": doc.get("nombre"),
-            "riesgo": pred["riesgo"],
-            "motivo": pred["motivo"],
-            "recomendacion": pred["recomendacion"],
-        }
+        enc = db.encuestas.find_one({'id_alumno': payload['id_alumno']})
+        if not enc:
+            raise HTTPException(status_code=404, detail='Encuesta no encontrada')
+        # Intentar recuperar el alumno para obtener nombre
+        nombre = None
+        try:
+            alumno = db.alumnos.find_one({'_id': ObjectId(payload['id_alumno'])})
+            if alumno:
+                nombre = alumno.get('nombre_completo') or (
+                    f"{(alumno.get('nombre') or '').strip()} {(alumno.get('apellidos') or '').strip()}".strip()
+                ) or alumno.get('nombre')
+        except Exception:
+            pass
+
+        pred = _compute_prediction(enc)
+        resp = {**enc, **pred}
+        if nombre:
+            resp['nombre_completo'] = nombre
+        # Incluir nombre_grupo si está disponible en el alumno
+        try:
+            if alumno:
+                resp['nombre_grupo'] = alumno.get('nombre_grupo') or alumno.get('grupo')
+        except Exception:
+            pass
+        # Eliminar ids
+        resp.pop('id_alumno', None)
+        resp.pop('_id', None)
+        return resp
     except HTTPException:
         raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/predict/batch")
-def predict_batch():
+@app.post('/predict/by_matricula', response_model=Dict[str, Any])
+def predict_by_matricula(payload: Dict[str, Any] = Body(...)):
+    """Recibe {"matricula": "..."} y busca al alumno y su encuesta para predecir."""
+    if 'matricula' not in payload:
+        raise HTTPException(status_code=400, detail='Falta matricula')
+
     try:
-        db = conectar_mongodb() if _HAS_CONEXION else _connect_mongo_from_env()
-        encuestas_col = db["encuestas"]
-        docs = list(encuestas_col.find({}))
+        if _HAS_CONEXION:
+            db = conectar_mongodb()
+        else:
+            db = _connect_mongo_from_env()
 
-        results = []
-        for d in docs:
-            try:
-                pred = _compute_prediction(d)
-                results.append({
-                    "id_alumno": d.get("id_alumno"),
-                    "nombre": d.get("nombre"),
-                    "riesgo": pred["riesgo"],
-                    "motivo": pred["motivo"],
-                    "recomendacion": pred["recomendacion"],
-                })
-            except Exception:
-                traceback.print_exc()
+        alumno = db.alumnos.find_one({'matricula': payload['matricula']})
+        if not alumno:
+            raise HTTPException(status_code=404, detail='Alumno no encontrado')
 
-        return {"cantidad": len(results), "resultados": results}
+        enc = db.encuestas.find_one({'id_alumno': str(alumno.get('_id'))})
+        if not enc:
+            raise HTTPException(status_code=404, detail='Encuesta no encontrada para el alumno')
+
+        # Inyectar id_alumno y matricula en el documento por si faltan
+        enc.setdefault('id_alumno', str(alumno.get('_id')))
+        enc.setdefault('matricula', alumno.get('matricula'))
+        nombre = alumno.get('nombre_completo') or (
+            f"{(alumno.get('nombre') or '').strip()} {(alumno.get('apellidos') or '').strip()}".strip()
+        ) or alumno.get('nombre')
+        pred = _compute_prediction(enc)
+        resp = {**enc, **pred}
+        if nombre:
+            resp['nombre_completo'] = nombre
+        # Incluir nombre_grupo si está disponible en el alumno
+        resp['nombre_grupo'] = alumno.get('nombre_grupo') or alumno.get('grupo')
+        # Eliminar ids
+        resp.pop('id_alumno', None)
+        resp.pop('_id', None)
+        return resp
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-if __name__ == "__main__":
+@app.post('/predict/batch')
+def predict_batch(save: bool = True):
+    """Predice para todas las encuestas existentes. Si save=True, guarda/actualiza en colección 'predicciones'.
+    Retorna un resumen con contadores.
+    """
+    try:
+        if _HAS_CONEXION:
+            db = conectar_mongodb()
+        else:
+            db = _connect_mongo_from_env()
+
+        encuestas = list(db.encuestas.find())
+        results = []
+        updates = []
+        for enc in encuestas:
+            try:
+                pred = _compute_prediction(enc)
+                # Agregar resultado en memoria (sin id)
+                res_mem = {**enc, **pred}
+                res_mem.pop('id_alumno', None)
+                res_mem.pop('_id', None)
+                results.append(res_mem)
+                if save:
+                    doc = {
+                        'id_alumno': enc.get('id_alumno'),
+                        'riesgo': pred['riesgo'],
+                        'motivo': pred['motivo'],
+                        'recomendacion': pred['recomendacion']
+                    }
+                    updates.append(doc)
+            except Exception:
+                # skip failing records but continue
+                traceback.print_exc()
+                continue
+
+        if save and updates:
+            from pymongo import UpdateOne
+            operations = [UpdateOne({'id_alumno': u['id_alumno']}, {'$set': u}, upsert=True) for u in updates]
+            result = db.predicciones.bulk_write(operations)
+            return {"predicciones_procesadas": len(updates), "modified": result.modified_count, "upserted": len(result.upserted_ids)}
+
+        return {"predicciones_procesadas": len(results)}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# If the user runs this script directly, start uvicorn
+if _name_ == '_main_':
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run('main:app', host='0.0.0.0', port=int(os.getenv('PORT', 8000)), reload=True)
