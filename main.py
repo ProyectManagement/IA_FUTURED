@@ -19,6 +19,7 @@ import os
 import joblib
 import traceback
 import pandas as pd
+from bson import ObjectId
 
 # Optional import: use existing conexion.py if available
 try:
@@ -196,21 +197,52 @@ def predict_by_matricula(payload: Dict[str, Any] = Body(...)):
     try:
         db = conectar_mongodb() if _HAS_CONEXION else _connect_mongo_from_env()
 
+        # Buscar alumno por matrícula
         alumno = db.alumnos.find_one({'matricula': payload['matricula']})
         if not alumno:
             raise HTTPException(status_code=404, detail='Alumno no encontrado')
 
+        # Buscar encuesta usando el ObjectId del alumno
         enc = db.encuestas.find_one({'id_alumno': str(alumno.get('_id'))})
+        if not enc:
+            # Intentar buscar con ObjectId directamente
+            try:
+                enc = db.encuestas.find_one({'id_alumno': ObjectId(alumno.get('_id'))})
+            except:
+                enc = None
+
         if not enc:
             raise HTTPException(status_code=404, detail='Encuesta no encontrada para el alumno')
 
-        # Inyectar datos de respuesta
-        enc['id_alumno'] = str(alumno.get('_id'))
-        enc['matricula'] = alumno.get('matricula')
-        enc['nombre_completo'] = f"{alumno.get('nombre', '')} {alumno.get('app', '')} {alumno.get('apm', '')}".strip()
-        enc['nombre_grupo'] = db.grupo.find_one({'_id': enc.get('id_grupo')}).get('nombre') if enc.get('id_grupo') else None
+        # Preparar datos para la respuesta
+        enc_dict = dict(enc)
+        enc_dict['id_alumno'] = str(alumno.get('_id'))
+        enc_dict['matricula'] = alumno.get('matricula')
+        enc_dict['nombre_completo'] = f"{alumno.get('nombre', '')} {alumno.get('app', '')} {alumno.get('apm', '')}".strip()
+        
+        # Obtener nombre del grupo de forma segura
+        nombre_grupo = None
+        if enc.get('id_grupo'):
+            grupo = db.grupo.find_one({'_id': enc.get('id_grupo')})
+            if grupo:
+                nombre_grupo = grupo.get('nombre')
+        
+        enc_dict['nombre_grupo'] = nombre_grupo
 
-        return predict_single(EncuestaInput(**enc))
+        # Realizar predicción
+        X = _prepare_X_from_document(enc_dict)
+        riesgo, motivo, recomendacion = _predict_riesgo(X)
+
+        return PredictResult(
+            id_alumno=enc_dict.get('id_alumno'),
+            matricula=enc_dict.get('matricula'),
+            nombre_completo=enc_dict.get('nombre_completo'),
+            nombre_grupo=enc_dict.get('nombre_grupo'),
+            riesgo=riesgo,
+            motivo=motivo,
+            recomendacion=recomendacion
+        )
+
     except HTTPException:
         raise
     except Exception as e:
