@@ -172,23 +172,50 @@ def _compute_prediction(doc: Dict[str, Any]) -> Dict[str, Any]:
         "recomendacion": recomendacion,
     }
 
+# Helper: formatea la respuesta incluyendo nombres legibles y excluyendo ids
+def _format_response(base: Dict[str, Any], pred: Dict[str, Any], alumno: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    resp: Dict[str, Any] = {**base, **pred}
+
+    # Nombre completo
+    nombre = base.get('nombre_alumno') or base.get('nombre')
+    if alumno:
+        nombre = (
+            alumno.get('nombre_completo') or (
+                f"{(alumno.get('nombre') or '').strip()} {(alumno.get('apellidos') or '').strip()}".strip()
+            ) or alumno.get('nombre') or nombre
+        )
+        # Grupo y carrera (nombres legibles)
+        ng = alumno.get('nombre_grupo') or alumno.get('grupo') or alumno.get('grupo_nombre')
+        if ng:
+            resp['nombre_grupo'] = ng
+        nc = alumno.get('nombre_carrera') or alumno.get('carrera') or alumno.get('carrera_nombre')
+        if nc:
+            resp['nombre_carrera'] = nc
+
+        # Asegurar matricula si existe en alumno
+        if alumno.get('matricula') and not resp.get('matricula'):
+            resp['matricula'] = alumno.get('matricula')
+
+    if nombre:
+        resp['nombre_completo'] = nombre
+
+    # Evitar duplicados
+    resp.pop('nombre', None)
+    resp.pop('nombre_alumno', None)
+
+    # Eliminar ids (mantener 'matricula')
+    for k in list(resp.keys()):
+        if k == '_id' or k == 'id_alumno' or k.endswith('_id') or k.startswith('id_'):
+            resp.pop(k, None)
+
+    return resp
+
 @app.post("/predict", response_model=Dict[str, Any])
 def predict_single(encuesta: EncuestaInput = Body(...)):
     try:
         doc = encuesta.dict()
         pred = _compute_prediction(doc)
-        # Si el nombre viene en la encuesta, úsalo; si no, None
-        nombre = doc.get('nombre_alumno') or doc.get('nombre')
-        resp = {**doc, **pred}
-        if nombre:
-            resp['nombre_completo'] = nombre
-            # Evitar duplicados si venía como 'nombre'
-            resp.pop('nombre', None)
-            resp.pop('nombre_alumno', None)
-        # Eliminar ids en la respuesta
-        resp.pop('id_alumno', None)
-        resp.pop('_id', None)
-        return resp
+        return _format_response(doc, pred)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
@@ -220,19 +247,7 @@ def predict_from_db(payload: Dict[str, Any] = Body(...)):
             pass
 
         pred = _compute_prediction(enc)
-        resp = {**enc, **pred}
-        if nombre:
-            resp['nombre_completo'] = nombre
-        # Incluir nombre_grupo si está disponible en el alumno
-        try:
-            if alumno:
-                resp['nombre_grupo'] = alumno.get('nombre_grupo') or alumno.get('grupo')
-        except Exception:
-            pass
-        # Eliminar ids
-        resp.pop('id_alumno', None)
-        resp.pop('_id', None)
-        return resp
+        return _format_response(enc, pred, alumno)
     except HTTPException:
         raise
     except Exception as e:
@@ -266,15 +281,7 @@ def predict_by_matricula(payload: Dict[str, Any] = Body(...)):
             f"{(alumno.get('nombre') or '').strip()} {(alumno.get('apellidos') or '').strip()}".strip()
         ) or alumno.get('nombre')
         pred = _compute_prediction(enc)
-        resp = {**enc, **pred}
-        if nombre:
-            resp['nombre_completo'] = nombre
-        # Incluir nombre_grupo si está disponible en el alumno
-        resp['nombre_grupo'] = alumno.get('nombre_grupo') or alumno.get('grupo')
-        # Eliminar ids
-        resp.pop('id_alumno', None)
-        resp.pop('_id', None)
-        return resp
+        return _format_response(enc, pred, alumno)
     except HTTPException:
         raise
     except Exception as e:
@@ -297,11 +304,15 @@ def predict_batch(save: bool = True):
         updates = []
         for enc in encuestas:
             try:
+                # Intentar obtener alumno para nombres
+                alumno = None
+                try:
+                    alumno = db.alumnos.find_one({'_id': ObjectId(enc.get('id_alumno'))}) if enc.get('id_alumno') else None
+                except Exception:
+                    alumno = None
                 pred = _compute_prediction(enc)
-                # Agregar resultado en memoria (sin id)
-                res_mem = {**enc, **pred}
-                res_mem.pop('id_alumno', None)
-                res_mem.pop('_id', None)
+                # Agregar resultado en memoria (formateado, sin ids)
+                res_mem = _format_response(enc, pred, alumno)
                 results.append(res_mem)
                 if save:
                     doc = {
