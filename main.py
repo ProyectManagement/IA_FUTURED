@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List, Any, Dict
+from bson import ObjectId
 import os
 import joblib
 import traceback
@@ -66,6 +67,7 @@ class EncuestaInput(BaseModel):
 
 class PredictResult(BaseModel):
     id_alumno: Optional[str]
+    nombre_alumno: Optional[str]
     riesgo: float
     motivo: str
     recomendacion: str
@@ -146,29 +148,38 @@ def _prepare_X_from_document(doc: Dict[str, Any]) -> pd.DataFrame:
 
     return df
 
+def _compute_prediction(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Recibe una encuesta en el cuerpo y devuelve la probabilidad de abandono con motivo y recomendacion."""
+    X = _prepare_X_from_document(doc)
+    prob = float(_model.predict_proba(X)[:, 1][0])
+    porcentaje = round(prob * 100, 2)
+
+    if porcentaje >= 80:
+        motivo = "Alto riesgo: múltiples factores académicos y personales"
+        recomendacion = "Asesoría académica urgente y apoyo psicológico"
+    elif porcentaje >= 60:
+        motivo = "Riesgo medio: bajo promedio o problemas personales"
+        recomendacion = "Tutoría y monitoreo continuo"
+    elif porcentaje >= 40:
+        motivo = "Riesgo leve: dificultad para estudiar o motivación baja"
+        recomendacion = "Seguimiento por tutor y actividades motivacionales"
+    else:
+        motivo = "Sin riesgo aparente"
+        recomendacion = "Mantener seguimiento regular"
+    return {
+        "riesgo": porcentaje,
+        "motivo": motivo,
+        "recomendacion": recomendacion,
+    }
+
 @app.post("/predict", response_model=PredictResult)
 def predict_single(encuesta: EncuestaInput = Body(...)):
-    """Recibe una encuesta en el cuerpo y devuelve la probabilidad de abandono con motivo y recomendacion."""
     try:
         doc = encuesta.dict()
-        X = _prepare_X_from_document(doc)
-        prob = float(_model.predict_proba(X)[:, 1][0])
-        porcentaje = round(prob * 100, 2)
-
-        if porcentaje >= 80:
-            motivo = "Alto riesgo: múltiples factores académicos y personales"
-            recomendacion = "Asesoría académica urgente y apoyo psicológico"
-        elif porcentaje >= 60:
-            motivo = "Riesgo medio: bajo promedio o problemas personales"
-            recomendacion = "Tutoría y monitoreo continuo"
-        elif porcentaje >= 40:
-            motivo = "Riesgo leve: dificultad para estudiar o motivación baja"
-            recomendacion = "Seguimiento por tutor y actividades motivacionales"
-        else:
-            motivo = "Sin riesgo aparente"
-            recomendacion = "Mantener seguimiento regular"
-
-        return PredictResult(id_alumno=doc.get('id_alumno'), riesgo=porcentaje, motivo=motivo, recomendacion=recomendacion)
+        pred = _compute_prediction(doc)
+        # Si el nombre viene en la encuesta, úsalo; si no, None
+        nombre = doc.get('nombre_alumno') or doc.get('nombre')
+        return PredictResult(id_alumno=doc.get('id_alumno'), nombre_alumno=nombre, **pred)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
@@ -188,8 +199,19 @@ def predict_from_db(payload: Dict[str, Any] = Body(...)):
         enc = db.encuestas.find_one({'id_alumno': payload['id_alumno']})
         if not enc:
             raise HTTPException(status_code=404, detail='Encuesta no encontrada')
+        # Intentar recuperar el alumno para obtener nombre
+        nombre = None
+        try:
+            alumno = db.alumnos.find_one({'_id': ObjectId(payload['id_alumno'])})
+            if alumno:
+                nombre = alumno.get('nombre_completo') or (
+                    f"{(alumno.get('nombre') or '').strip()} {(alumno.get('apellidos') or '').strip()}".strip()
+                ) or alumno.get('nombre')
+        except Exception:
+            pass
 
-        return predict_single(EncuestaInput(**enc))
+        pred = _compute_prediction(enc)
+        return PredictResult(id_alumno=enc.get('id_alumno'), nombre_alumno=nombre, **pred)
     except HTTPException:
         raise
     except Exception as e:
@@ -219,7 +241,11 @@ def predict_by_matricula(payload: Dict[str, Any] = Body(...)):
         # Inyectar id_alumno y matricula en el documento por si faltan
         enc.setdefault('id_alumno', str(alumno.get('_id')))
         enc.setdefault('matricula', alumno.get('matricula'))
-        return predict_single(EncuestaInput(**enc))
+        nombre = alumno.get('nombre_completo') or (
+            f"{(alumno.get('nombre') or '').strip()} {(alumno.get('apellidos') or '').strip()}".strip()
+        ) or alumno.get('nombre')
+        pred = _compute_prediction(enc)
+        return PredictResult(id_alumno=enc.get('id_alumno'), nombre_alumno=nombre, **pred)
     except HTTPException:
         raise
     except Exception as e:
@@ -273,4 +299,3 @@ def predict_batch(save: bool = True):
 if __name__ == '__main__':
     import uvicorn
     uvicorn.run('main:app', host='0.0.0.0', port=int(os.getenv('PORT', 8000)), reload=True)
-
