@@ -1,3 +1,16 @@
+"""
+FastAPI service for FuturEd prediction model.
+- Loads trained model and label encoders from modelo_entrenado/
+- Connects to MongoDB (uses conexion.conectar_mongodb() if available, otherwise MONGODB_URI env)
+- Endpoints:
+  - GET /health
+  - POST /predict (body: encuesta-like JSON) -> returns riesgo, motivo, recomendacion
+  - POST /predict/from_db (body: {"id_alumno": "..."}) -> fetches encuesta from Mongo and predicts
+  - POST /predict/by_matricula -> fetches alumno by matricula and predicts
+
+Run: uvicorn main:app --reload --port 8000
+"""
+
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -7,20 +20,22 @@ import joblib
 import traceback
 import pandas as pd
 
-# Intentar importar conexion.py si existe
+# Optional import: use existing conexion.py if available
 try:
     from conexion import conectar_mongodb
     _HAS_CONEXION = True
 except Exception:
     _HAS_CONEXION = False
 
+# Utility: connect to MongoDB if conexion not available
 def _connect_mongo_from_env():
     from pymongo import MongoClient
-    uri = os.getenv('MONGODB_URI', 'mongodb+srv://FutuRed:qotG44JpqoexRsjv@cluster0.yf9o1kh.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0')
+    uri = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/futured')
     client = MongoClient(uri)
     dbname = os.getenv('MONGODB_DB', 'futured')
     return client[dbname]
 
+# Paths
 MODEL_PATH = os.getenv('MODEL_PATH', 'modelo_entrenado/modelo.pkl')
 ENCODERS_PATH = os.getenv('ENCODERS_PATH', 'modelo_entrenado/label_encoders.pkl')
 
@@ -38,6 +53,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# -----------------------------
+# Schemas
+# -----------------------------
 class EncuestaInput(BaseModel):
     id_alumno: Optional[str]
     matricula: Optional[str]
@@ -49,10 +67,16 @@ class EncuestaInput(BaseModel):
 
 class PredictResult(BaseModel):
     id_alumno: Optional[str]
+    matricula: Optional[str]
+    nombre_completo: Optional[str]
+    nombre_grupo: Optional[str]
     riesgo: float
     motivo: str
     recomendacion: str
 
+# -----------------------------
+# Startup: load model
+# -----------------------------
 @app.on_event("startup")
 def load_resources():
     global _model, _label_encoders, _feature_names
@@ -73,8 +97,10 @@ def load_resources():
 def health():
     return {"status": "ok", "model_loaded": _model is not None}
 
+# -----------------------------
+# Utils
+# -----------------------------
 def _normalize_document_for_model(doc: Dict[str, Any]) -> Dict[str, Any]:
-    # Solo las features que el modelo conoce
     aspectos = doc.get('aspectos_socioeconomicos', {})
     salud = doc.get('condiciones_salud', {})
     academico = doc.get('analisis_academico', {})
@@ -100,12 +126,12 @@ def _prepare_X_from_document(doc: Dict[str, Any]) -> pd.DataFrame:
     normalized = _normalize_document_for_model(doc)
     df = pd.DataFrame([normalized])
 
-    # Map Sí/No a 1/0
+    # Map Sí/No to 1/0
     for col in ["trabaja", "padecimiento_cronico", "atencion_psicologica"]:
         if col in df.columns:
             df[col] = df[col].map({"Sí": 1, "Si": 1, "No": 0}).fillna(0).astype(int)
 
-    # Aplicar label encoders
+    # Apply label encoders
     if _label_encoders:
         for col, le in _label_encoders.items():
             if col in df.columns:
@@ -114,55 +140,50 @@ def _prepare_X_from_document(doc: Dict[str, Any]) -> pd.DataFrame:
                 except Exception:
                     df[col] = 0
 
-    # Mantener solo features del modelo
+    # Keep only features used in training
     if _feature_names:
         df = df.reindex(columns=_feature_names, fill_value=0)
 
     return df
 
+def _predict_riesgo(X: pd.DataFrame) -> (float, str, str):
+    prob = float(_model.predict_proba(X)[:, 1][0])
+    porcentaje = round(prob * 100, 2)
+
+    if porcentaje >= 80:
+        motivo = "Alto riesgo: múltiples factores académicos y personales"
+        recomendacion = "Asesoría académica urgente y apoyo psicológico"
+    elif porcentaje >= 60:
+        motivo = "Riesgo medio: bajo promedio o problemas personales"
+        recomendacion = "Tutoría y monitoreo continuo"
+    elif porcentaje >= 40:
+        motivo = "Riesgo leve: dificultad para estudiar o motivación baja"
+        recomendacion = "Seguimiento por tutor y actividades motivacionales"
+    else:
+        motivo = "Sin riesgo aparente"
+        recomendacion = "Mantener seguimiento regular"
+
+    return porcentaje, motivo, recomendacion
+
+# -----------------------------
+# Endpoints
+# -----------------------------
 @app.post("/predict", response_model=PredictResult)
 def predict_single(encuesta: EncuestaInput = Body(...)):
     try:
         doc = encuesta.dict()
         X = _prepare_X_from_document(doc)
-        prob = float(_model.predict_proba(X)[:, 1][0])
-        porcentaje = round(prob * 100, 2)
-
-        if porcentaje >= 80:
-            motivo = "Alto riesgo: múltiples factores académicos y personales"
-            recomendacion = "Asesoría académica urgente y apoyo psicológico"
-        elif porcentaje >= 60:
-            motivo = "Riesgo medio: bajo promedio o problemas personales"
-            recomendacion = "Tutoría y monitoreo continuo"
-        elif porcentaje >= 40:
-            motivo = "Riesgo leve: dificultad para estudiar o motivación baja"
-            recomendacion = "Seguimiento por tutor y actividades motivacionales"
-        else:
-            motivo = "Sin riesgo aparente"
-            recomendacion = "Mantener seguimiento regular"
+        riesgo, motivo, recomendacion = _predict_riesgo(X)
 
         return PredictResult(
             id_alumno=doc.get('id_alumno'),
-            riesgo=porcentaje,
+            matricula=doc.get('matricula'),
+            nombre_completo=doc.get('nombre_completo'),
+            nombre_grupo=doc.get('nombre_grupo'),
+            riesgo=riesgo,
             motivo=motivo,
             recomendacion=recomendacion
         )
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post('/predict/from_db', response_model=PredictResult)
-def predict_from_db(payload: Dict[str, Any] = Body(...)):
-    if 'id_alumno' not in payload:
-        raise HTTPException(status_code=400, detail='Falta id_alumno')
-    try:
-        db = conectar_mongodb() if _HAS_CONEXION else _connect_mongo_from_env()
-        enc = db.encuestas.find_one({'id_alumno': payload['id_alumno']})
-        if not enc:
-            raise HTTPException(status_code=404, detail='Encuesta no encontrada')
-        return predict_single(EncuestaInput(**enc))
-    except HTTPException:
-        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
@@ -171,19 +192,39 @@ def predict_from_db(payload: Dict[str, Any] = Body(...)):
 def predict_by_matricula(payload: Dict[str, Any] = Body(...)):
     if 'matricula' not in payload:
         raise HTTPException(status_code=400, detail='Falta matricula')
+
     try:
         db = conectar_mongodb() if _HAS_CONEXION else _connect_mongo_from_env()
+
         alumno = db.alumnos.find_one({'matricula': payload['matricula']})
         if not alumno:
             raise HTTPException(status_code=404, detail='Alumno no encontrado')
+
         enc = db.encuestas.find_one({'id_alumno': str(alumno.get('_id'))})
         if not enc:
             raise HTTPException(status_code=404, detail='Encuesta no encontrada para el alumno')
-        enc.setdefault('id_alumno', str(alumno.get('_id')))
-        enc.setdefault('matricula', alumno.get('matricula'))
+
+        # Inyectar datos de respuesta
+        enc['id_alumno'] = str(alumno.get('_id'))
+        enc['matricula'] = alumno.get('matricula')
+        enc['nombre_completo'] = f"{alumno.get('nombre', '')} {alumno.get('app', '')} {alumno.get('apm', '')}".strip()
+        enc['nombre_grupo'] = db.grupo.find_one({'_id': enc.get('id_grupo')}).get('nombre') if enc.get('id_grupo') else None
+
         return predict_single(EncuestaInput(**enc))
     except HTTPException:
         raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+# Health check endpoint
+@app.get("/health")
+def health():
+    return {"status": "ok", "model_loaded": _model is not None}
+
+# -----------------------------
+# Run directly
+# -----------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv('PORT', 8000)), reload=True)
