@@ -328,6 +328,6 @@ def predict_batch(save: bool = True):
         raise HTTPException(status_code=500, detail=str(e))
 
 # If the user runs this script directly, start uvicorn
-if _name_ == '_main_':
+  if __name__ == "__main__":
     import uvicorn
     uvicorn.run('main:app', host='0.0.0.0', port=int(os.getenv('PORT', 8000)), reload=True)
