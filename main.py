@@ -30,7 +30,7 @@ except Exception:
 # Utility: connect to MongoDB if conexion not available
 def _connect_mongo_from_env():
     from pymongo import MongoClient
-    uri = os.getenv('MONGODB_URI', 'mongodb+srv://FutuRed:qotG44JpqoexRsjv@cluster0.yf9o1kh.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0')
+    uri = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/futured')
     client = MongoClient(uri)
     # If the URI contains a database name after the slash, pymongo's ``MongoClient(uri)``
     # still gives access to client.get_default_database(), but for simplicity we'll use 'futured'
@@ -181,13 +181,9 @@ def predict_single(encuesta: EncuestaInput = Body(...)):
         nombre = doc.get('nombre_alumno') or doc.get('nombre')
         resp = {**doc, **pred}
         if nombre:
-            resp['nombre_completo'] = nombre
-            # Evitar duplicados si venía como 'nombre'
-            resp.pop('nombre', None)
-            resp.pop('nombre_alumno', None)
-        # Eliminar ids en la respuesta
+            resp['nombre'] = nombre
+        # Eliminar id del alumno en la respuesta
         resp.pop('id_alumno', None)
-        resp.pop('_id', None)
         return resp
     except Exception as e:
         traceback.print_exc()
@@ -222,16 +218,8 @@ def predict_from_db(payload: Dict[str, Any] = Body(...)):
         pred = _compute_prediction(enc)
         resp = {**enc, **pred}
         if nombre:
-            resp['nombre_completo'] = nombre
-        # Incluir nombre_grupo si está disponible en el alumno
-        try:
-            if alumno:
-                resp['nombre_grupo'] = alumno.get('nombre_grupo') or alumno.get('grupo')
-        except Exception:
-            pass
-        # Eliminar ids
+            resp['nombre'] = nombre
         resp.pop('id_alumno', None)
-        resp.pop('_id', None)
         return resp
     except HTTPException:
         raise
@@ -268,12 +256,8 @@ def predict_by_matricula(payload: Dict[str, Any] = Body(...)):
         pred = _compute_prediction(enc)
         resp = {**enc, **pred}
         if nombre:
-            resp['nombre_completo'] = nombre
-        # Incluir nombre_grupo si está disponible en el alumno
-        resp['nombre_grupo'] = alumno.get('nombre_grupo') or alumno.get('grupo')
-        # Eliminar ids
+            resp['nombre'] = nombre
         resp.pop('id_alumno', None)
-        resp.pop('_id', None)
         return resp
     except HTTPException:
         raise
@@ -301,7 +285,6 @@ def predict_batch(save: bool = True):
                 # Agregar resultado en memoria (sin id)
                 res_mem = {**enc, **pred}
                 res_mem.pop('id_alumno', None)
-                res_mem.pop('_id', None)
                 results.append(res_mem)
                 if save:
                     doc = {
