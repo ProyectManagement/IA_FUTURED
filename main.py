@@ -1,344 +1,121 @@
-"""
-FastAPI service for FuturEd prediction model.
-- Loads trained model and label encoders from `modelo_entrenado/`
-- Connects to MongoDB (uses `conexion.conectar_mongodb()` if available, otherwise MONGODB_URI env)
-- Endpoints:
-  - GET /health
-  - POST /predict (body: encuesta-like JSON) -> returns riesgo, motivo, recomendacion
-  - POST /predict/from_db (body: {"id_alumno": "..."}) -> fetches encuesta from Mongo and predicts
-  - POST /predict/batch -> predicts for all encuestas and optionally saves to `predicciones` collection
-
-Run: `uvicorn main:app --reload --port 8000`
-"""
-
-from fastapi import FastAPI, HTTPException, Body
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import Optional, List, Any, Dict
-from bson import ObjectId
-import os
-import joblib
-import traceback
-
-# Optional import: use existing conexion.py if user has it
-try:
-    from conexion import conectar_mongodb
-    _HAS_CONEXION = True
-except Exception:
-    _HAS_CONEXION = False
-
-# Utility: connect to MongoDB if conexion not available
-def _connect_mongo_from_env():
-    from pymongo import MongoClient
-    uri = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/futured')
-    client = MongoClient(uri)
-    # If the URI contains a database name after the slash, pymongo's ``MongoClient(uri)``
-    # still gives access to client.get_default_database(), but for simplicity we'll use 'futured'
-    dbname = os.getenv('MONGODB_DB', 'futured')
-    return client[dbname]
-
-# Load model + encoders on startup
-MODEL_PATH = os.getenv('MODEL_PATH', 'modelo_entrenado/modelo.pkl')
-ENCODERS_PATH = os.getenv('ENCODERS_PATH', 'modelo_entrenado/label_encoders.pkl')
-
-_model = None
-_label_encoders = None
-_feature_names = None
-
-app = FastAPI(title="FuturEd - IA de predicción de abandono")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class EncuestaInput(BaseModel):
-    id_alumno: Optional[str]
-    matricula: Optional[str]
-    aspectos_socioeconomicos: Optional[Dict[str, Any]] = None
-    condiciones_salud: Optional[Dict[str, Any]] = None
-    analisis_academico: Optional[Dict[str, Any]] = None
-    # Accept arbitrary extra fields too
-    class Config:
-        extra = 'allow'
-
-class PredictResult(BaseModel):
-    id_alumno: Optional[str]
-    nombre: Optional[str]
-    riesgo: float
-    motivo: str
-    recomendacion: str
-
-@app.on_event("startup")
-def load_resources():
-    global _model, _label_encoders, _feature_names
-    try:
-        _model = joblib.load(MODEL_PATH)
-        _label_encoders = joblib.load(ENCODERS_PATH)
-        # feature names available in scikit-learn >= 1.0 via attribute
-        try:
-            _feature_names = list(_model.feature_names_in_)
-        except Exception:
-            _feature_names = None
-        print(f"Modelo cargado desde: {MODEL_PATH}")
-    except Exception as e:
-        print("No se pudo cargar el modelo en startup:", str(e))
-        _model = None
-        _label_encoders = None
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "model_loaded": _model is not None}
-
-
-def _normalize_document_for_model(doc: Dict[str, Any]) -> Dict[str, Any]:
-    # Keep consistent with modelo.normalizar_documento
-    aspectos = doc.get('aspectos_socioeconomicos', {})
-    salud = doc.get('condiciones_salud', {})
-    academico = doc.get('analisis_academico', {})
-
-    return {
-        "id_alumno": doc.get('id_alumno'),
-        "matricula": doc.get('matricula'),
-        "trabaja": aspectos.get('trabaja'),
-        "ingreso_mensual": aspectos.get('ingreso_mensual'),
-        "padecimiento_cronico": salud.get('padecimiento_cronico'),
-        "atencion_psicologica": salud.get('atencion_psicologica'),
-        "horas_sueno": salud.get('horas_sueno'),
-        "alimentacion": salud.get('alimentacion'),
-        "materias_reprobadas": academico.get('materias_reprobadas'),
-        "promedio_previo": academico.get('promedio_previo'),
-        "motivacion": academico.get('motivacion'),
-        "dificultad_estudio": academico.get('dificultad_estudio'),
-        "expectativa_terminar": academico.get('expectativa_terminar')
-    }
-
 import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import classification_report
+import joblib
+import os
 
-def _prepare_X_from_document(doc: Dict[str, Any]) -> pd.DataFrame:
-    if _model is None:
-        raise RuntimeError("Modelo no cargado")
-
-    normalized = _normalize_document_for_model(doc)
-    df = pd.DataFrame([normalized])
-
-    # Map Sí/No to 1/0 for specific columns if present
-    for col in ["trabaja", "padecimiento_cronico", "atencion_psicologica"]:
-        if col in df.columns:
-            df[col] = df[col].map({"Sí": 1, "Si": 1, "No": 0}).fillna(0).astype(int)
-
-    # Apply label encoders
-    if _label_encoders:
-        for col, le in _label_encoders.items():
-            if col in df.columns:
-                try:
-                    df[col] = le.transform(df[col].astype(str))
-                except Exception:
-                    df[col] = 0
-
-    # Ensure all model features exist
-    if _feature_names:
-        for col in _feature_names:
-            if col not in df.columns:
-                df[col] = 0
-        df = df[_feature_names]
-
-    return df
-
-def _compute_prediction(doc: Dict[str, Any]) -> Dict[str, Any]:
-    """Recibe una encuesta en el cuerpo y devuelve la probabilidad de abandono con motivo y recomendacion."""
-    X = _prepare_X_from_document(doc)
-    prob = float(_model.predict_proba(X)[:, 1][0])
-    porcentaje = round(prob * 100, 2)
-
-    if porcentaje >= 80:
-        motivo = "Alto riesgo: múltiples factores académicos y personales"
-        recomendacion = "Asesoría académica urgente y apoyo psicológico"
-    elif porcentaje >= 60:
-        motivo = "Riesgo medio: bajo promedio o problemas personales"
-        recomendacion = "Tutoría y monitoreo continuo"
-    elif porcentaje >= 40:
-        motivo = "Riesgo leve: dificultad para estudiar o motivación baja"
-        recomendacion = "Seguimiento por tutor y actividades motivacionales"
-    else:
-        motivo = "Sin riesgo aparente"
-        recomendacion = "Mantener seguimiento regular"
+def normalizar_documento(doc):
     return {
-        "riesgo": porcentaje,
-        "motivo": motivo,
-        "recomendacion": recomendacion,
+        "id_alumno": doc.get("id_alumno"),
+        "matricula": doc.get("matricula"),
+        "trabaja": doc.get("aspectos_socioeconomicos", {}).get("trabaja"),
+        "ingreso_mensual": doc.get("aspectos_socioeconomicos", {}).get("ingreso_mensual"),
+        "padecimiento_cronico": doc.get("condiciones_salud", {}).get("padecimiento_cronico"),
+        "atencion_psicologica": doc.get("condiciones_salud", {}).get("atencion_psicologica"),
+        "horas_sueno": doc.get("condiciones_salud", {}).get("horas_sueno"),
+        "alimentacion": doc.get("condiciones_salud", {}).get("alimentacion"),
+        "materias_reprobadas": doc.get("analisis_academico", {}).get("materias_reprobadas"),
+        "promedio_previo": doc.get("analisis_academico", {}).get("promedio_previo"),
+        "motivacion": doc.get("analisis_academico", {}).get("motivacion"),
+        "dificultad_estudio": doc.get("analisis_academico", {}).get("dificultad_estudio"),
+        "expectativa_terminar": doc.get("analisis_academico", {}).get("expectativa_terminar"),
+        "abandona": doc.get("abandona", "No")
     }
 
-# Helper: formatea la respuesta incluyendo nombres legibles y excluyendo ids
-def _format_response(base: Dict[str, Any], pred: Dict[str, Any], alumno: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    resp: Dict[str, Any] = {**base, **pred}
+def preparar_datos(encuestas):
+    datos = [normalizar_documento(doc) for doc in encuestas]
+    df = pd.DataFrame(datos)
 
-    # Nombre completo
-    nombre = base.get('nombre_alumno') or base.get('nombre')
-    if alumno:
-        nombre = (
-            alumno.get('nombre_completo') or (
-                f"{(alumno.get('nombre') or '').strip()} {(alumno.get('apellidos') or '').strip()}".strip()
-            ) or alumno.get('nombre') or nombre
-        )
-        # Grupo y carrera (nombres legibles)
-        ng = alumno.get('nombre_grupo') or alumno.get('grupo') or alumno.get('grupo_nombre')
-        if ng:
-            resp['nombre_grupo'] = ng
-        nc = alumno.get('nombre_carrera') or alumno.get('carrera') or alumno.get('carrera_nombre')
-        if nc:
-            resp['nombre_carrera'] = nc
+    # Eliminar filas con datos nulos en variables clave
+    required = [
+        "trabaja", "ingreso_mensual", "padecimiento_cronico",
+        "atencion_psicologica", "materias_reprobadas", "promedio_previo",
+        "motivacion", "dificultad_estudio", "expectativa_terminar", "abandona"
+    ]
+    df = df.dropna(subset=required)
 
-        # Asegurar matricula si existe en alumno
-        if alumno.get('matricula') and not resp.get('matricula'):
-            resp['matricula'] = alumno.get('matricula')
+    # Mapear Sí/No a 1/0 para variables binarias
+    for col in ["trabaja", "padecimiento_cronico", "atencion_psicologica"]:
+        df[col] = df[col].map({"Sí": 1, "No": 0}).fillna(0).astype(int)
 
-    if nombre:
-        resp['nombre_completo'] = nombre
+    # Etiqueta binaria
+    y = df["abandona"].map(lambda x: 1 if x == "Sí" else 0)
 
-    # Evitar duplicados
-    resp.pop('nombre', None)
-    resp.pop('nombre_alumno', None)
+    X = df.drop(columns=["id_alumno", "abandona", "matricula"], errors="ignore")
 
-    # Eliminar ids (mantener 'matricula')
-    for k in list(resp.keys()):
-        if k == '_id' or k == 'id_alumno' or k.endswith('_id') or k.startswith('id_'):
-            resp.pop(k, None)
+    # Codificar variables categóricas y guardar los encoders
+    label_encoders = {}
+    for col in X.select_dtypes(include=["object"]).columns:
+        le = LabelEncoder()
+        X[col] = le.fit_transform(X[col].astype(str))
+        label_encoders[col] = le
 
-    return resp
+    return X, y, df, label_encoders
 
-@app.post("/predict", response_model=Dict[str, Any])
-def predict_single(encuesta: EncuestaInput = Body(...)):
-    try:
-        doc = encuesta.dict()
-        pred = _compute_prediction(doc)
-        return _format_response(doc, pred)
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+def entrenar_modelo(X, y):
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    modelo = RandomForestClassifier(n_estimators=100, random_state=42)
+    modelo.fit(X_train, y_train)
 
-@app.post('/predict/from_db', response_model=Dict[str, Any])
-def predict_from_db(payload: Dict[str, Any] = Body(...)):
-    """Recibe {'id_alumno': '...'} y busca la encuesta correspondiente en MongoDB para predecir."""
-    if 'id_alumno' not in payload:
-        raise HTTPException(status_code=400, detail='Falta id_alumno')
+    y_pred = modelo.predict(X_test)
+    print("📊 Evaluación del modelo:\n", classification_report(y_test, y_pred))
 
-    try:
-        if _HAS_CONEXION:
-            db = conectar_mongodb()
-        else:
-            db = _connect_mongo_from_env()
+    return modelo
 
-        enc = db.encuestas.find_one({'id_alumno': payload['id_alumno']})
-        if not enc:
-            raise HTTPException(status_code=404, detail='Encuesta no encontrada')
-        # Intentar recuperar el alumno para obtener nombre
-        nombre = None
-        try:
-            alumno = db.alumnos.find_one({'_id': ObjectId(payload['id_alumno'])})
-            if alumno:
-                nombre = alumno.get('nombre_completo') or (
-                    f"{(alumno.get('nombre') or '').strip()} {(alumno.get('apellidos') or '').strip()}".strip()
-                ) or alumno.get('nombre')
-        except Exception:
-            pass
+def guardar_modelo(modelo, label_encoders):
+    os.makedirs('modelo_entrenado', exist_ok=True)
+    joblib.dump(modelo, 'modelo_entrenado/modelo.pkl')
+    joblib.dump(label_encoders, 'modelo_entrenado/label_encoders.pkl')
+    print("✅ Modelo y encoders guardados en la carpeta 'modelo_entrenado'")
 
-        pred = _compute_prediction(enc)
-        return _format_response(enc, pred, alumno)
-    except HTTPException:
-        raise
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+def cargar_modelo():
+    modelo = joblib.load('modelo_entrenado/modelo.pkl')
+    label_encoders = joblib.load('modelo_entrenado/label_encoders.pkl')
+    return modelo, label_encoders
 
-@app.post('/predict/by_matricula', response_model=Dict[str, Any])
-def predict_by_matricula(payload: Dict[str, Any] = Body(...)):
-    """Recibe {"matricula": "..."} y busca al alumno y su encuesta para predecir."""
-    if 'matricula' not in payload:
-        raise HTTPException(status_code=400, detail='Falta matricula')
-
-    try:
-        if _HAS_CONEXION:
-            db = conectar_mongodb()
-        else:
-            db = _connect_mongo_from_env()
-
-        alumno = db.alumnos.find_one({'matricula': payload['matricula']})
-        if not alumno:
-            raise HTTPException(status_code=404, detail='Alumno no encontrado')
-
-        enc = db.encuestas.find_one({'id_alumno': str(alumno.get('_id'))})
-        if not enc:
-            raise HTTPException(status_code=404, detail='Encuesta no encontrada para el alumno')
-
-        # Inyectar id_alumno y matricula en el documento por si faltan
-        enc.setdefault('id_alumno', str(alumno.get('_id')))
-        enc.setdefault('matricula', alumno.get('matricula'))
-        nombre = alumno.get('nombre_completo') or (
-            f"{(alumno.get('nombre') or '').strip()} {(alumno.get('apellidos') or '').strip()}".strip()
-        ) or alumno.get('nombre')
-        pred = _compute_prediction(enc)
-        return _format_response(enc, pred, alumno)
-    except HTTPException:
-        raise
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post('/predict/batch')
-def predict_batch(save: bool = True):
-    """Predice para todas las encuestas existentes. Si save=True, guarda/actualiza en colección 'predicciones'.
-    Retorna un resumen con contadores.
-    """
-    try:
-        if _HAS_CONEXION:
-            db = conectar_mongodb()
-        else:
-            db = _connect_mongo_from_env()
-
-        encuestas = list(db.encuestas.find())
-        results = []
-        updates = []
-        for enc in encuestas:
+def predecir_riesgo(modelo, df, datos_originales, label_encoders):
+    X_pred = df.drop(columns=["id_alumno", "abandona", "matricula"], errors="ignore")
+    
+    # Aplicar los mismos label encoders
+    for col, le in label_encoders.items():
+        if col in X_pred.columns:
             try:
-                # Intentar obtener alumno para nombres
-                alumno = None
-                try:
-                    alumno = db.alumnos.find_one({'_id': ObjectId(enc.get('id_alumno'))}) if enc.get('id_alumno') else None
-                except Exception:
-                    alumno = None
-                pred = _compute_prediction(enc)
-                # Agregar resultado en memoria (formateado, sin ids)
-                res_mem = _format_response(enc, pred, alumno)
-                results.append(res_mem)
-                if save:
-                    doc = {
-                        'id_alumno': enc.get('id_alumno'),
-                        'riesgo': pred['riesgo'],
-                        'motivo': pred['motivo'],
-                        'recomendacion': pred['recomendacion']
-                    }
-                    updates.append(doc)
-            except Exception:
-                # skip failing records but continue
-                traceback.print_exc()
-                continue
+                X_pred[col] = le.transform(X_pred[col].astype(str))
+            except:
+                X_pred[col] = 0  # Valor por defecto si falla la transformación
 
-        if save and updates:
-            from pymongo import UpdateOne
-            operations = [UpdateOne({'id_alumno': u['id_alumno']}, {'$set': u}, upsert=True) for u in updates]
-            result = db.predicciones.bulk_write(operations)
-            return {"predicciones_procesadas": len(updates), "modified": result.modified_count, "upserted": len(result.upserted_ids)}
+    # Asegurar que tenemos todas las columnas que el modelo espera
+    for col in modelo.feature_names_in_:
+        if col not in X_pred.columns:
+            X_pred[col] = 0
+    X_pred = X_pred[modelo.feature_names_in_]
 
-        return {"predicciones_procesadas": len(results)}
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+    predicciones = modelo.predict_proba(X_pred)[:, 1]  # Probabilidad de clase positiva
 
-# If the user runs this script directly, start uvicorn
-if __name__ == '__main__':
-    import uvicorn
-    uvicorn.run('main:app', host='0.0.0.0', port=int(os.getenv('PORT', 8000)), reload=True)
+    resultados = []
+    for i, riesgo in enumerate(predicciones):
+        porcentaje = round(riesgo * 100, 2)
+
+        if porcentaje >= 80:
+            motivo = "Alto riesgo: múltiples factores académicos y personales"
+            recomendacion = "Asesoría académica urgente y apoyo psicológico"
+        elif porcentaje >= 60:
+            motivo = "Riesgo medio: bajo promedio o problemas personales"
+            recomendacion = "Tutoría y monitoreo continuo"
+        elif porcentaje >= 40:
+            motivo = "Riesgo leve: dificultad para estudiar o motivación baja"
+            recomendacion = "Seguimiento por tutor y actividades motivacionales"
+        else:
+            motivo = "Sin riesgo aparente"
+            recomendacion = "Mantener seguimiento regular"
+
+        resultados.append({
+            "id_alumno": datos_originales[i].get("id_alumno"),
+            "riesgo": porcentaje,
+            "motivo": motivo,
+            "recomendacion": recomendacion
+        })
+
+    return resultados
