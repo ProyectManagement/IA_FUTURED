@@ -30,7 +30,7 @@ except Exception:
 # Utility: connect to MongoDB if conexion not available
 def _connect_mongo_from_env():
     from pymongo import MongoClient
-    uri = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/futured')
+    uri = os.getenv('MONGODB_URI', 'mongodb+srv://FutuRed:qotG44JpqoexRsjv@cluster0.yf9o1kh.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0')
     client = MongoClient(uri)
     # If the URI contains a database name after the slash, pymongo's `MongoClient(uri)`
     # still gives access to client.get_default_database(), but for simplicity we'll use 'futured'
