@@ -1,7 +1,5 @@
 """
 FastAPI service for FuturEd prediction model.
-
-Features:
 - Loads trained model and label encoders from modelo_entrenado/
 - Connects to MongoDB (uses conexion.conectar_mongodb() if available, otherwise MONGODB_URI env)
 - Endpoints:
@@ -13,39 +11,31 @@ Features:
 Run: uvicorn main:app --reload --port 8000
 """
 
-import os
-import traceback
-import joblib
-import pandas as pd
-from typing import Optional, Dict, Any
-
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional, Dict, Any
+import os
+import joblib
+import traceback
+import pandas as pd
 
-# -----------------------------
-# MongoDB Connection
-# -----------------------------
+# Optional import: use existing conexion.py if available
 try:
     from conexion import conectar_mongodb
     _HAS_CONEXION = True
-except ImportError:
+except Exception:
     _HAS_CONEXION = False
 
+# Utility: connect to MongoDB if conexion not available
 def _connect_mongo_from_env():
-    """Fallback MongoDB connection from environment variables"""
     from pymongo import MongoClient
-    uri = os.getenv(
-        'MONGODB_URI',
-        'mongodb+srv://FutuRed:qotG44JpqoexRsjv@cluster0.yf9o1kh.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0'
-    )
+    uri = os.getenv('MONGODB_URI', 'mongodb+srv://FutuRed:qotG44JpqoexRsjv@cluster0.yf9o1kh.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0')
     client = MongoClient(uri)
     dbname = os.getenv('MONGODB_DB', 'futured')
     return client[dbname]
 
-# -----------------------------
-# Paths and Global Variables
-# -----------------------------
+# Paths
 MODEL_PATH = os.getenv('MODEL_PATH', 'modelo_entrenado/modelo.pkl')
 ENCODERS_PATH = os.getenv('ENCODERS_PATH', 'modelo_entrenado/label_encoders.pkl')
 
@@ -53,9 +43,6 @@ _model = None
 _label_encoders = None
 _feature_names = None
 
-# -----------------------------
-# FastAPI App
-# -----------------------------
 app = FastAPI(title="FuturEd - IA de predicción de abandono")
 
 app.add_middleware(
@@ -75,10 +62,8 @@ class EncuestaInput(BaseModel):
     aspectos_socioeconomicos: Optional[Dict[str, Any]] = None
     condiciones_salud: Optional[Dict[str, Any]] = None
     analisis_academico: Optional[Dict[str, Any]] = None
-
     class Config:
         extra = 'allow'
-
 
 class PredictResult(BaseModel):
     id_alumno: Optional[str]
@@ -90,7 +75,7 @@ class PredictResult(BaseModel):
     recomendacion: str
 
 # -----------------------------
-# Startup: Load Model & Encoders
+# Startup: load model
 # -----------------------------
 @app.on_event("startup")
 def load_resources():
@@ -108,9 +93,6 @@ def load_resources():
         _model = None
         _label_encoders = None
 
-# -----------------------------
-# Health Check
-# -----------------------------
 @app.get("/health")
 def health():
     return {"status": "ok", "model_loaded": _model is not None}
@@ -206,7 +188,6 @@ def predict_single(encuesta: EncuestaInput = Body(...)):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post('/predict/by_matricula', response_model=PredictResult)
 def predict_by_matricula(payload: Dict[str, Any] = Body(...)):
     if 'matricula' not in payload:
@@ -215,24 +196,21 @@ def predict_by_matricula(payload: Dict[str, Any] = Body(...)):
     try:
         db = conectar_mongodb() if _HAS_CONEXION else _connect_mongo_from_env()
 
-        # Fetch alumno
         alumno = db.alumnos.find_one({'matricula': payload['matricula']})
         if not alumno:
             raise HTTPException(status_code=404, detail='Alumno no encontrado')
 
-        # Fetch encuesta
         enc = db.encuestas.find_one({'id_alumno': str(alumno.get('_id'))})
         if not enc:
             raise HTTPException(status_code=404, detail='Encuesta no encontrada para el alumno')
 
-        # Inject additional info
+        # Inyectar datos de respuesta
         enc['id_alumno'] = str(alumno.get('_id'))
         enc['matricula'] = alumno.get('matricula')
         enc['nombre_completo'] = f"{alumno.get('nombre', '')} {alumno.get('app', '')} {alumno.get('apm', '')}".strip()
         enc['nombre_grupo'] = db.grupo.find_one({'_id': enc.get('id_grupo')}).get('nombre') if enc.get('id_grupo') else None
 
         return predict_single(EncuestaInput(**enc))
-
     except HTTPException:
         raise
     except Exception as e:
@@ -240,13 +218,8 @@ def predict_by_matricula(payload: Dict[str, Any] = Body(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------
-# Run app directly
+# Run directly
 # -----------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=int(os.getenv('PORT', 8000)),
-        reload=True
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv('PORT', 8000)), reload=True)
