@@ -1,8 +1,8 @@
 fastapi
-uvicorn
-pydantic
-pandas
-joblib
-scikit-learn
-pymongo
+uvicorn[standard] 
+pydantic 
+pandas 
+joblib 
+scikit-learn 
+pymongo 
 python-dotenv
