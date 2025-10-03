@@ -31,7 +31,7 @@ except Exception:
 # MongoDB helper
 def _connect_mongo_from_env():
     from pymongo import MongoClient
-    uri = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/futured')
+    uri = os.getenv('MONGODB_URI', 'mongodb+srv://FutuRed:qotG44JpqoexRsjv@cluster0.yf9o1kh.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0')
     client = MongoClient(uri)
     dbname = os.getenv('MONGODB_DB', 'futured')
     return client[dbname]
