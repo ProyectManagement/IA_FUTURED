@@ -1,3 +1,8 @@
-pymongo
+fastapi
+uvicorn
+pydantic
 pandas
+joblib
 scikit-learn
+pymongo
+python-dotenv
