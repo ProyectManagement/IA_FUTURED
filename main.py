@@ -67,7 +67,7 @@ class EncuestaInput(BaseModel):
 
 class PredictResult(BaseModel):
     id_alumno: Optional[str]
-    nombre_alumno: Optional[str]
+    nombre: Optional[str]
     riesgo: float
     motivo: str
     recomendacion: str
@@ -172,19 +172,24 @@ def _compute_prediction(doc: Dict[str, Any]) -> Dict[str, Any]:
         "recomendacion": recomendacion,
     }
 
-@app.post("/predict", response_model=PredictResult)
+@app.post("/predict", response_model=Dict[str, Any])
 def predict_single(encuesta: EncuestaInput = Body(...)):
     try:
         doc = encuesta.dict()
         pred = _compute_prediction(doc)
         # Si el nombre viene en la encuesta, úsalo; si no, None
         nombre = doc.get('nombre_alumno') or doc.get('nombre')
-        return PredictResult(id_alumno=doc.get('id_alumno'), nombre_alumno=nombre, **pred)
+        resp = {**doc, **pred}
+        if nombre:
+            resp['nombre'] = nombre
+        # Eliminar id del alumno en la respuesta
+        resp.pop('id_alumno', None)
+        return resp
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post('/predict/from_db', response_model=PredictResult)
+@app.post('/predict/from_db', response_model=Dict[str, Any])
 def predict_from_db(payload: Dict[str, Any] = Body(...)):
     """Recibe {'id_alumno': '...'} y busca la encuesta correspondiente en MongoDB para predecir."""
     if 'id_alumno' not in payload:
@@ -211,14 +216,18 @@ def predict_from_db(payload: Dict[str, Any] = Body(...)):
             pass
 
         pred = _compute_prediction(enc)
-        return PredictResult(id_alumno=enc.get('id_alumno'), nombre_alumno=nombre, **pred)
+        resp = {**enc, **pred}
+        if nombre:
+            resp['nombre'] = nombre
+        resp.pop('id_alumno', None)
+        return resp
     except HTTPException:
         raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post('/predict/by_matricula', response_model=PredictResult)
+@app.post('/predict/by_matricula', response_model=Dict[str, Any])
 def predict_by_matricula(payload: Dict[str, Any] = Body(...)):
     """Recibe {"matricula": "..."} y busca al alumno y su encuesta para predecir."""
     if 'matricula' not in payload:
@@ -245,7 +254,11 @@ def predict_by_matricula(payload: Dict[str, Any] = Body(...)):
             f"{(alumno.get('nombre') or '').strip()} {(alumno.get('apellidos') or '').strip()}".strip()
         ) or alumno.get('nombre')
         pred = _compute_prediction(enc)
-        return PredictResult(id_alumno=enc.get('id_alumno'), nombre_alumno=nombre, **pred)
+        resp = {**enc, **pred}
+        if nombre:
+            resp['nombre'] = nombre
+        resp.pop('id_alumno', None)
+        return resp
     except HTTPException:
         raise
     except Exception as e:
@@ -268,15 +281,17 @@ def predict_batch(save: bool = True):
         updates = []
         for enc in encuestas:
             try:
-                res = predict_single(EncuestaInput(**enc))
-                results.append(res.dict())
+                pred = _compute_prediction(enc)
+                # Agregar resultado en memoria (sin id)
+                res_mem = {**enc, **pred}
+                res_mem.pop('id_alumno', None)
+                results.append(res_mem)
                 if save:
-                    filtro = {'id_alumno': res.id_alumno}
                     doc = {
-                        'id_alumno': res.id_alumno,
-                        'riesgo': res.riesgo,
-                        'motivo': res.motivo,
-                        'recomendacion': res.recomendacion
+                        'id_alumno': enc.get('id_alumno'),
+                        'riesgo': pred['riesgo'],
+                        'motivo': pred['motivo'],
+                        'recomendacion': pred['recomendacion']
                     }
                     updates.append(doc)
             except Exception:
