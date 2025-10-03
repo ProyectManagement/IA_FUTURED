@@ -218,36 +218,14 @@ def predict_by_matricula(payload: Dict[str, Any] = Body(...)):
         enc_dict = dict(enc)
         enc_dict['id_alumno'] = str(alumno.get('_id'))
         enc_dict['matricula'] = alumno.get('matricula')
-        
-        # Construir nombre completo correctamente
-        nombre = alumno.get('nombre', '')
-        app = alumno.get('app', '')
-        apm = alumno.get('apm', '')
-        enc_dict['nombre_completo'] = f"{nombre} {app} {apm}".strip()
+        enc_dict['nombre_completo'] = f"{alumno.get('nombre', '')} {alumno.get('app', '')} {alumno.get('apm', '')}".strip()
         
         # Obtener nombre del grupo de forma segura
-        nombre_grupo = "No disponible"
-        id_grupo = enc.get('id_grupo')
-        
-        if id_grupo:
-            try:
-                # Intentar buscar por ObjectId
-                grupo = db.grupo.find_one({'_id': ObjectId(id_grupo)})
-                if grupo:
-                    nombre_grupo = grupo.get('nombre', 'No disponible')
-                else:
-                    # Intentar buscar por string si no se encuentra con ObjectId
-                    grupo = db.grupo.find_one({'_id': id_grupo})
-                    if grupo:
-                        nombre_grupo = grupo.get('nombre', 'No disponible')
-            except:
-                # Si hay error con ObjectId, buscar directamente por string
-                try:
-                    grupo = db.grupo.find_one({'_id': id_grupo})
-                    if grupo:
-                        nombre_grupo = grupo.get('nombre', 'No disponible')
-                except:
-                    nombre_grupo = "No disponible"
+        nombre_grupo = None
+        if enc.get('id_grupo'):
+            grupo = db.grupo.find_one({'_id': enc.get('id_grupo')})
+            if grupo:
+                nombre_grupo = grupo.get('nombre')
         
         enc_dict['nombre_grupo'] = nombre_grupo
 
@@ -270,63 +248,6 @@ def predict_by_matricula(payload: Dict[str, Any] = Body(...)):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-
-# Endpoints de debugging para verificar datos
-@app.post('/debug/alumno/{matricula}')
-def debug_alumno(matricula: str):
-    try:
-        db = conectar_mongodb() if _HAS_CONEXION else _connect_mongo_from_env()
-        
-        alumno = db.alumnos.find_one({'matricula': matricula})
-        if not alumno:
-            return {"error": "Alumno no encontrado"}
-            
-        encuesta = db.encuestas.find_one({'id_alumno': str(alumno['_id'])})
-        if not encuesta:
-            # Intentar con ObjectId
-            try:
-                encuesta = db.encuestas.find_one({'id_alrupo = None
-        if encuesta and encuesta.get('id_grupo'):
-            grupo = db.grupo.find_one({'_id': ObjectId(encuesta['id_grupo'])})
-            if grupo:
-                nombre_grupo = grupo.get('nombre')
-        
-        return {
-            "alumno": {
-                "_id": str(alumno['_id']),
-                "matricula": alumno.get('matricula'),
-                "nombre": alumno.get('nombre'),
-                "app": alumno.get('app'),
-                "apm": alumno.get('apm')
-            },
-            "encuesta": {
-                "id_grupo": encuesta.get('id_grupo') if encuesta else None,
-                "tiene_encuesta": encuesta is not None
-            },
-            "grupo": {
-                "nombre": nombre_grupo,
-                "encontrado": nombre_grupo is not None
-            }
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.get('/debug/grupos')
-def debug_grupos():
-    try:
-        db = conectar_mongodb() if _HAS_CONEXION else _connect_mongo_from_env()
-        grupos = list(db.grupo.find().limit(10))
-        return {
-            "total_grupos": len(grupos),
-            "grupos": [
-                {
-                    "_id": str(grupo['_id']),
-                    "nombre": grupo.get('nombre')
-                } for grupo in grupos
-            ]
-        }
-    except Exception as e:
-        return {"error": str(e)}
 
 # -----------------------------
 # Run directly
